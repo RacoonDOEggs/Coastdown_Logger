@@ -2,7 +2,7 @@
 
 This tool measures the coast-down of a brushed DC motor. You use the results to estimate the rotor inertia **J** and the friction ratios **b/J** (viscous) and **τc/J** (dry/Coulomb).
 
-Each test waits for the motor to be stationary, spins it up until its speed is steady, cuts the drive (PWM = 0, coasting with no braking) and records the speed until the motor stops. An Arduino runs the test and measures the speed; a Python script on the PC controls the runs and saves the data to a CSV file.
+Each test waits for the motor to be stationary, spins it up until its speed is steady, cuts the drive (PWM = 0, coasting with no braking) and records the speed until the motor stops. An Arduino runs the test and measures the speed, a Python script on the PC controls the runs and saves the data to a CSV file, and a second script fits the coast-down curves to get b/J and τc/J (and J itself when b or τc is known).
 
 ## Project structure
 
@@ -10,6 +10,7 @@ Each test waits for the motor to be stationary, spins it up until its speed is s
 .
 ├── platformio.ini           # PlatformIO configuration
 ├── coastdown_logger.py      # PC-side script: runs tests, writes the CSV
+├── coastdown_fit.py         # PC-side script: fits the coast-down curves in the CSV
 ├── README.md
 ├── include/
 │   └── pinout.h             # MOTOR_PWM_PIN, ENCONDER_PIN, ...
@@ -29,10 +30,10 @@ Each test waits for the motor to be stationary, spins it up until its speed is s
 - Python 3.8 or newer, with these packages:
 
 ```bash
-pip install pyserial matplotlib
+pip install pyserial numpy scipy matplotlib
 ```
 
-matplotlib is optional and is only used by `--plot`.
+`coastdown_logger.py` needs only pyserial (plus matplotlib for `--plot`). `coastdown_fit.py` needs numpy and scipy (plus matplotlib for `--plot` and `--save-plot`).
 
 ## PlatformIO setup
 
@@ -106,6 +107,14 @@ Press **Ctrl+C** at any time to abort. The script then tells the Arduino to turn
 | `--out`    | `coastdown_YYYYMMDD_HHMMSS.csv` | Path of the output CSV file                                                 |
 | `--plot`   | off                             | Show the coast-down curves when the runs are finished                       |
 
+### 4. Fit the results
+
+```bash
+python coastdown_fit.py coastdown_YYYYMMDD_HHMMSS.csv --plot
+```
+
+See [Fitting the results](#fitting-the-results) for details.
+
 ## Output CSV
 
 All runs are written to a single file with one row per sample, taken at 100 Hz. The file is saved after every run, so if a later run fails, the earlier runs are kept.
@@ -122,20 +131,100 @@ All runs are written to a single file with one row per sample, taken at 100 Hz. 
 | `rpm`         | Speed estimate                                                                              |
 | `omega_rad_s` | The same speed in rad/s                                                                     |
 
-### Using the data for fitting
+## Fitting the results
 
-- Keep only the rows where `phase == 1` and `new_edges > 0`. On rows where `new_edges == 0`, no pulse arrived during that sample, so `rpm` is only an upper limit, not a measurement.
-- With the motor open circuit, no current flows, so the motor follows
+`coastdown_fit.py` fits the coast-down curves in a CSV written by the logger.
 
-  J·dω/dt = −b·ω − τc
+### The model
 
-  and the speed decays as
+With the motor open circuit, no current flows, so the rotor obeys
 
-  ω(t) = (ω₀ + τc/b)·e^(−b·t/J) − τc/b
+```
+J·dω/dt = −b·ω − τc        (while ω > 0)
+```
 
-  Fit this curve to `omega_rad_s` against `t_s` to get b/J and τc/J. If b and τc are known from steady-state tests, J follows directly.
-- Fit the curve itself rather than differentiating the speed data, because the derivative of encoder data is very noisy.
-- Runs from different PWM levels should give the same b/J and τc/J. If they don't, the friction model needs refining.
+and the speed decays as
+
+```
+ω(t) = (ω₀ + a/β)·e^(−β·t) − a/β,     β = b/J,  a = τc/J
+```
+
+The coast-down alone can only give the ratios **b/J** (in 1/s) and **τc/J** (in rad/s²). To get **J**, you need b or τc from a separate test, such as a steady-state sweep of voltage against speed:
+
+```
+J = b / (b/J)     or     J = τc / (τc/J)
+```
+
+### Running the fit
+
+From the project root:
+
+```bash
+python coastdown_fit.py coastdown_20261117_220222.csv --plot
+```
+
+If you know b and/or τc, pass them to get J:
+
+```bash
+python coastdown_fit.py coastdown_20261117_220222.csv --b 1.2e-4 --tau-c 3.5e-3 --save-plot fit.png
+```
+
+The script does two fits:
+
+1. **Per run** (ω₀, b/J and τc/J all free). The spread between runs shows how repeatable the test is.
+2. **Joint fit** over all runs, with b/J and τc/J shared and a separate ω₀ for each run. This is the final estimate.
+
+Example output:
+
+```
+Per-run fits (±1σ)
+ run  pwm   pts   ω0 [RPM]          b/J [1/s]        τc/J [rad/s²]  RMSE [RPM]
+   1  120   603       2820    0.3000 ± 0.0003     15.001 ± 0.032           4.0
+   2  120   605       2830    0.3000 ± 0.0003     15.002 ± 0.031           4.0
+   ...
+
+Joint fit over all runs (±1σ)
+  b/J  = 0.29997 ± 0.00013 1/s   (mechanical coast time constant J/b = 3.33 s)
+  τc/J = 15.003 ± 0.015 rad/s²
+  RMSE = 4.0 RPM
+  Viscous and Coulomb friction are equal at 478 RPM (viscous dominates above, Coulomb below).
+
+  J = b / (b/J)     = 0.001 kg·m²   (from --b 0.0003)
+  J = τc / (τc/J)   = 0.0009998 kg·m²   (from --tau-c 0.015)
+  The two estimates of J differ by 0.0 %.
+```
+
+When both `--b` and `--tau-c` are given, the difference between the two J estimates is a useful check of the whole parameter set: a large difference means at least one of b, τc or the friction model is off.
+
+### Fit options
+
+| Option        | Default                | Description                                                              |
+|---------------|------------------------|--------------------------------------------------------------------------|
+| `csv`         | *(required)*           | CSV file written by `coastdown_logger.py`                                |
+| `--runs`      | all                    | Only fit these run numbers, e.g. `--runs 1 2 3`                          |
+| `--min-rpm`   | `0`                    | Ignore points below this speed (to exclude stiction effects near standstill) |
+| `--b`         | —                      | Viscous friction b in N·m·s/rad, to compute J                            |
+| `--tau-c`     | —                      | Coulomb friction τc in N·m, to compute J                                 |
+| `--out`       | `<input>_fit.csv`      | Path of the results CSV                                                  |
+| `--plot`      | off                    | Show the data, fitted curves and residuals                               |
+| `--save-plot` | —                      | Save the plot to an image file (e.g. `fit.png`)                          |
+
+### Results CSV
+
+One row per run (`fit = run`) and one row for the joint fit (`fit = joint`), with columns `run`, `pwm`, `points`, `omega0_rad_s`, `b_over_J`, `b_over_J_err`, `tauc_over_J`, `tauc_over_J_err`, `rmse_rad_s`, `J_from_b` and `J_from_tauc`. The `_err` columns are 1σ uncertainties, and the J columns are filled only on the joint row when `--b` or `--tau-c` is given.
+
+### Which data points are used
+
+- Only rows with `phase == 1` (coasting) and `new_edges > 0` are used. On rows where `new_edges == 0`, no pulse arrived during that sample, so `rpm` is only an upper limit, not a measurement.
+- Each speed is an average over the interval between two encoder pulses, so the fit timestamps it at the middle of that interval (from `edge_t_s`), not at the sample time.
+- Intervals that started before the drive was cut are dropped, because they mix driven and coasting motion.
+- Runs with fewer than 5 usable points are skipped.
+
+### Checking the fit
+
+- **Residuals:** in the plot, they should be scattered randomly around zero. A clear S-shape or other pattern means the viscous-plus-Coulomb model is missing something, such as friction that grows faster than linearly with speed (a fan or air drag on the load).
+- **Consistency:** runs at different PWM levels should give the same b/J and τc/J. If they don't, that also points to the friction model.
+- **Low-speed points:** stiction can distort the last few points before the motor stops. If they pull the fit off, exclude them with `--min-rpm` (for example `--min-rpm 100`).
 
 ## How the firmware measures speed
 
@@ -202,6 +291,12 @@ Electrical noise from the motor brushes may be creating false pulses. Shield or 
 
 **The motor stops much faster than expected**
 Check that the driver really coasts at PWM = 0 rather than braking.
+
+**`coastdown_fit.py`: "No usable coast-down data in the file"**
+No run has at least 5 coasting points with real measurements. This happens with files recorded before the firmware fix in commit `e0b3db9`, where each run ended right after the cut. Record new data with the current firmware.
+
+**`coastdown_fit.py`: b/J comes out as 0, or the fit is poor**
+A b/J of 0 means the fit found no viscous component, so the motor slows almost linearly (Coulomb friction dominates). Check the residual plot; if the low-speed points are the problem, try `--min-rpm`. Very short coast-downs (only a few dozen points) also give poorly determined values, so spin up to a higher PWM if you can.
 
 **Linker error: multiple definition of `setup` / `loop`**
 More than one firmware file is in `src/`. PlatformIO compiles every file there, so keep only `coastdown_test.cpp`, or give each firmware its own environment with `build_src_filter`.
