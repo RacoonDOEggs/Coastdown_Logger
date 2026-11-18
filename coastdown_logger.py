@@ -2,13 +2,14 @@
 """
 Coast-down test logger for the DC motor rig (pairs with coastdown_test.cpp).
 
-For each requested PWM level and repeat, the script tells the Arduino to spin the
-motor up, cut the drive (coast), and log encoder speed until the motor stops.
-All runs are written to a single CSV file.
+For each requested PWM level and repeat, the script tells the Arduino to wait for
+the motor to be stationary, spin it up until its speed is steady, cut the drive
+(coast), and log encoder speed until the motor stops. All runs are written to a
+single CSV file.
 
 Usage:
     pip install pyserial          (and matplotlib if you want --plot)
-    python coastdown_logger.py --port COM3 --pwm 120 180 255 --runs 3 --spinup 5000 --plot
+    python coastdown_logger.py --port COM3 --pwm 120 180 255 --runs 3 --plot
     python coastdown_logger.py --port /dev/ttyACM0 --pwm 200
 
 CSV columns:
@@ -54,20 +55,29 @@ def wait_for_ready(ser, timeout=6.0):
     return False
 
 
-def run_one(ser, pwm, spinup_ms, max_coast_s=65.0):
-    """Run a single coast-down test and return (rows, end_reason)."""
+def run_one(ser, pwm, max_spinup_ms, idle_timeout_s=10.0):
+    """Run a single coast-down test and return (rows, cut_reason, end_reason)."""
     ser.reset_input_buffer()
-    ser.write(f"RUN {pwm} {spinup_ms}\n".encode("ascii"))
+    ser.write(f"RUN {pwm} {max_spinup_ms}\n".encode("ascii"))
 
     samples = []
     cut_us = None
-    reason = None
-    deadline = time.time() + spinup_ms / 1000.0 + max_coast_s + 5.0
+    cut_reason = None
+    end_reason = None
+    waiting_reported = False
+    last_rx = time.time()
 
-    while time.time() < deadline:
+    while True:
         line = read_line(ser)
         if not line:
+            # The firmware always talks at least once per second (#WAIT or samples),
+            # so a long silence means the link or the board has a problem.
+            if time.time() - last_rx > idle_timeout_s:
+                raise TimeoutError("No data from the Arduino for "
+                                   f"{idle_timeout_s:.0f} s.")
             continue
+        last_rx = time.time()
+
         if line.startswith("D,"):
             parts = line.split(",")
             if len(parts) != 6:
@@ -78,19 +88,23 @@ def run_one(ser, pwm, spinup_ms, max_coast_s=65.0):
             except ValueError:
                 continue
             samples.append((t_us, phase, count, edge_us, rpm))
+        elif line == "#WAIT":
+            if not waiting_reported:
+                print("  waiting for the motor to stop ...", flush=True)
+                waiting_reported = True
         elif line.startswith("#CUT,"):
-            cut_us = int(line.split(",")[1])
+            parts = line.split(",")
+            cut_us = int(parts[1])
+            cut_reason = parts[2] if len(parts) > 2 else "?"
         elif line.startswith("#END,"):
-            reason = line.split(",")[1]
+            end_reason = line.split(",")[1]
             break
         elif line.startswith("#ERR,"):
             raise RuntimeError(f"Arduino error: {line[5:]}")
         # "#START" and anything else is ignored
 
-    if reason is None:
-        raise TimeoutError("No #END received from the Arduino.")
     if cut_us is None:
-        raise RuntimeError(f"Test ended ({reason}) before the drive was cut.")
+        raise RuntimeError(f"Test ended ({end_reason}) before the drive was cut.")
 
     rows = []
     prev_count = None
@@ -106,7 +120,7 @@ def run_one(ser, pwm, spinup_ms, max_coast_s=65.0):
             "rpm": rpm,
             "omega_rad_s": rpm * 2.0 * math.pi / 60.0,
         })
-    return rows, reason
+    return rows, cut_reason, end_reason
 
 
 def summarize(rows):
@@ -146,10 +160,12 @@ def main():
     ap.add_argument("--pwm", type=int, nargs="+", default=[200],
                     help="One or more PWM levels (1-255) to spin up to")
     ap.add_argument("--runs", type=int, default=3, help="Repeats per PWM level")
-    ap.add_argument("--spinup", type=int, default=5000,
-                    help="Spin-up duration in ms (long enough to reach steady speed)")
-    ap.add_argument("--rest", type=float, default=2.0,
-                    help="Pause between runs, seconds")
+    ap.add_argument("--spinup", type=int, default=30000,
+                    help="Maximum spin-up time in ms (100-60000). The drive is cut "
+                         "earlier, as soon as the speed is steady")
+    ap.add_argument("--rest", type=float, default=0.5,
+                    help="Pause between runs, seconds (the firmware also waits for "
+                         "the motor to stop before each run)")
     ap.add_argument("--out", default=None, help="Output CSV path")
     ap.add_argument("--plot", action="store_true", help="Plot the coast-down curves at the end")
     args = ap.parse_args()
@@ -157,6 +173,8 @@ def main():
     for p in args.pwm:
         if not 1 <= p <= 255:
             sys.exit(f"PWM {p} is out of range (1-255).")
+    if not 100 <= args.spinup <= 60000:
+        sys.exit("--spinup must be between 100 and 60000 ms.")
 
     out_path = args.out or f"coastdown_{datetime.now():%Y%m%d_%H%M%S}.csv"
 
@@ -175,8 +193,9 @@ def main():
             for pwm in args.pwm:
                 for rep in range(args.runs):
                     run_idx += 1
-                    print(f"Run {run_idx}: PWM {pwm}, spin-up {args.spinup} ms ...", flush=True)
-                    rows, reason = run_one(ser, pwm, args.spinup)
+                    print(f"Run {run_idx}: PWM {pwm}, max spin-up {args.spinup} ms ...",
+                          flush=True)
+                    rows, cut_reason, reason = run_one(ser, pwm, args.spinup)
 
                     for r in rows:
                         r["run"] = run_idx
@@ -186,11 +205,19 @@ def main():
                     all_rows.extend(rows)
 
                     rpm_cut, spread, coast_s = summarize(rows)
-                    print(f"  end: {reason}, {len(rows)} samples, "
-                          f"speed at cut {rpm_cut:.0f} RPM, coast time {coast_s:.2f} s")
-                    if spread > 2.0:
-                        print(f"  Warning: speed varied {spread:.1f}% in the last second of "
-                              f"spin-up; consider a longer --spinup.")
+                    spinup_s = -min(r["t_s"] for r in rows)
+                    print(f"  spin-up: {spinup_s:.1f} s ({cut_reason}), "
+                          f"speed at cut {rpm_cut:.0f} RPM")
+                    print(f"  coast:   {coast_s:.2f} s, end: {reason}, {len(rows)} samples")
+                    if cut_reason == "MAX_TIME":
+                        print("  Warning: speed was not steady when the drive was cut; "
+                              "consider a longer --spinup.")
+                    elif spread > 2.0:
+                        print(f"  Warning: speed varied {spread:.1f}% in the last second "
+                              f"of spin-up.")
+                    if reason != "STOPPED":
+                        print(f"  Warning: the run did not end with the motor stopped "
+                              f"({reason}).")
                     time.sleep(args.rest)
 
         print(f"Saved {len(all_rows)} rows to {out_path}")

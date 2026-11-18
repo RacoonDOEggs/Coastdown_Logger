@@ -2,19 +2,18 @@
 
 This tool measures the coast-down of a brushed DC motor. You use the results to estimate the rotor inertia **J** and the friction ratios **b/J** (viscous) and **τc/J** (dry/Coulomb).
 
-The test spins the motor up to a steady speed, cuts the drive (PWM = 0, coasting with no braking) and records the speed until the motor stops. An Arduino runs the test and measures the speed; a Python script on the PC controls the runs and saves the data to a CSV file.
+Each test waits for the motor to be stationary, spins it up until its speed is steady, cuts the drive (PWM = 0, coasting with no braking) and records the speed until the motor stops. An Arduino runs the test and measures the speed; a Python script on the PC controls the runs and saves the data to a CSV file.
 
 ## Project structure
 
 ```
 .
-├── platformio.ini           # PlatformIO configuration (two environments, see below)
+├── platformio.ini           # PlatformIO configuration
 ├── coastdown_logger.py      # PC-side script: runs tests, writes the CSV
 ├── README.md
 ├── include/
 │   └── pinout.h             # MOTOR_PWM_PIN, ENCONDER_PIN, ...
 └── src/
-    ├── main.cpp             # Manual control firmware
     └── coastdown_test.cpp   # Coast-down test firmware
 ```
 
@@ -41,22 +40,21 @@ matplotlib is optional and is only used by `--plot`.
 ; PlatformIO Project Configuration File
 ; https://docs.platformio.org/page/projectconf.html
 
-; Settings shared by both environments
-[env]
+[env:nanoatmega328new]
 platform = atmelavr
 board = nanoatmega328new
 framework = arduino
 monitor_speed = 115200
 ```
 
-> If uploading fails with `stk500_recv(): programmer is not responding`, your Nano probably has the old bootloader (common on clones). Change the board to `nanoatmega328` in the `[env]` section.
+> If uploading fails with `stk500_recv(): programmer is not responding`, your Nano probably has the old bootloader (common on clones). Change the board to `nanoatmega328` in `platformio.ini`.
 
 ## Running a test
 
 ### 1. Upload the coast-down firmware
 
 ```bash
-pio run -e coastdown -t upload
+pio run -t upload
 ```
 
 ### 2. Find the serial port
@@ -72,17 +70,26 @@ Typical names for a Nano are `COM3` (or another `COMx`) on Windows, `/dev/ttyUSB
 ### 3. Run the logger from the project root
 
 ```bash
-python coastdown_logger.py --port COM3 --pwm 120 180 255 --runs 3 --spinup 5000 --plot
+python coastdown_logger.py --port COM3 --pwm 120 180 255 --runs 3 --plot
 ```
 
 This example runs 3 tests at each of the PWM levels 120, 180 and 255, for 9 runs in total, and plots the coast-down curves at the end.
 
+Each run goes through three stages, all handled by the firmware:
+
+1. **Wait for standstill.** If the motor is still turning (for example from the previous run), the firmware waits until no encoder pulse has been seen for 1 s. The script prints `waiting for the motor to stop ...` while this happens.
+2. **Spin-up.** The motor is driven at the requested PWM. The firmware averages the speed over 1-second blocks and cuts the drive as soon as two consecutive blocks differ by less than 0.3 %. If that never happens, the drive is cut after `--spinup` ms.
+3. **Coast-down.** PWM is set to 0 and the speed is logged until the motor stops.
+
 After each run, the script prints a short summary:
 
 ```
-Run 1: PWM 120, spin-up 5000 ms ...
-  end: STOPPED, 812 samples, speed at cut 1843 RPM, coast time 2.95 s
+Run 1: PWM 120, max spin-up 30000 ms ...
+  spin-up: 9.0 s (STEADY), speed at cut 2821 RPM
+  coast:   6.08 s, end: STOPPED, 1514 samples
 ```
+
+`STEADY` means the speed had settled when the drive was cut. `MAX_TIME` means the `--spinup` limit was reached first, and the script prints a warning.
 
 Press **Ctrl+C** at any time to abort. The script then tells the Arduino to turn the motor off.
 
@@ -94,16 +101,10 @@ Press **Ctrl+C** at any time to abort. The script then tells the Arduino to turn
 | `--baud`   | `115200`                        | Must match `SERIAL_BAUD` in the firmware                                    |
 | `--pwm`    | `200`                           | One or more PWM levels (1–255) to spin up to                                |
 | `--runs`   | `3`                             | Number of repeats at each PWM level                                         |
-| `--spinup` | `5000`                          | Spin-up time in ms. It must be long enough for the motor to reach a steady speed |
-| `--rest`   | `2.0`                           | Pause between runs, in seconds                                              |
+| `--spinup` | `30000`                         | Maximum spin-up time in ms (100–60000). The drive is normally cut earlier, as soon as the speed is steady |
+| `--rest`   | `0.5`                           | Extra pause between runs, in seconds. The firmware already waits for the motor to stop before each run |
 | `--out`    | `coastdown_YYYYMMDD_HHMMSS.csv` | Path of the output CSV file                                                 |
 | `--plot`   | off                             | Show the coast-down curves when the runs are finished                       |
-
-### 4. Return to manual control
-
-```bash
-pio run -e manual -t upload
-```
 
 ## Output CSV
 
@@ -155,6 +156,9 @@ This method (often called M/T) stays accurate both at high speed and near stands
 | `SAMPLE_PERIOD_US`  | `10000`    | Logging period (10 ms = 100 Hz)                            |
 | `STOP_TIMEOUT_US`   | `1000000`  | Time without a pulse before the motor is considered stopped |
 | `MAX_COAST_US`      | `60000000` | Maximum length of the coast phase                          |
+| `MAX_WAIT_STOP_MS`  | `120000`   | Maximum time to wait for the motor to stop before a run    |
+| `STEADY_BLOCK_SAMPLES` | `100`   | Samples per averaging block for steady-state detection (100 = 1 s) |
+| `STEADY_TOL_PCT`    | `0.3`      | Two consecutive blocks closer than this (%) count as steady |
 | `ENCODER_GLITCH_US` | `50`       | Pulses closer together than this are rejected as noise     |
 
 ## Serial protocol
@@ -163,14 +167,15 @@ You can also drive the firmware by hand from a serial terminal (115200 baud, new
 
 | Direction       | Message                                     | Meaning                                         |
 |-----------------|---------------------------------------------|-------------------------------------------------|
-| PC → Arduino    | `RUN <pwm> <spinup_ms>`                     | Start one test (PWM 1–255, spin-up 100–60000 ms) |
+| PC → Arduino    | `RUN <pwm> <max_spinup_ms>`                 | Start one test (PWM 1–255, maximum spin-up 100–60000 ms) |
 | PC → Arduino    | `X`                                         | Abort / turn the motor off                      |
 | Arduino → PC    | `#READY`                                    | Board has booted                                |
-| Arduino → PC    | `#START,<pwm>,<spinup_ms>`                  | Test accepted                                   |
-| Arduino → PC    | `D,<t_us>,<phase>,<count>,<edge_us>,<rpm>`  | One sample (times in µs since the test started) |
-| Arduino → PC    | `#CUT,<t_us>`                               | The drive was cut at this time                  |
+| Arduino → PC    | `#START,<pwm>,<max_spinup_ms>`              | Test accepted                                   |
+| Arduino → PC    | `#WAIT`                                     | Motor still turning; waiting for it to stop (sent every second) |
+| Arduino → PC    | `D,<t_us>,<phase>,<count>,<edge_us>,<rpm>`  | One sample (times in µs since the motor was switched on) |
+| Arduino → PC    | `#CUT,<t_us>,<reason>`                      | The drive was cut at this time; reason is `STEADY` or `MAX_TIME` |
 | Arduino → PC    | `#END,<reason>`                             | `STOPPED`, `TIMEOUT` or `ABORTED`               |
-| Arduino → PC    | `#ERR,<message>`                            | Invalid command                                 |
+| Arduino → PC    | `#ERR,<message>`                            | Invalid command, or the motor did not stop before a run |
 
 ## Troubleshooting
 
@@ -178,13 +183,16 @@ You can also drive the firmware by hand from a serial terminal (115200 baud, new
 Another program is using the port. Close the PlatformIO serial monitor or the Arduino IDE.
 
 **"Warning: no #READY from the Arduino"**
-The Nano normally resets when the port is opened and prints `#READY` within about 2 seconds. If it doesn't, the board may still be running the manual firmware (upload with `-e coastdown`), or the reset did not happen. The script continues anyway; if the runs then fail, press the reset button on the Nano and start the script again.
+The Nano normally resets when the port is opened and prints `#READY` within about 2 seconds. If it doesn't, the board may be running different firmware (upload again with `pio run -t upload`), or the reset did not happen. The script continues anyway; if the runs then fail, press the reset button on the Nano and start the script again.
 
 **Upload fails with `stk500_recv(): programmer is not responding`**
-Your Nano has the old bootloader. Set `board = nanoatmega328` in the `[env]` section of `platformio.ini`.
+Your Nano has the old bootloader. Set `board = nanoatmega328` in `platformio.ini`.
 
-**"Speed varied X% in the last second of spin-up"**
-The motor had not reached a steady speed when the drive was cut. Increase `--spinup`.
+**"Speed was not steady when the drive was cut"**
+The spin-up reached the `--spinup` limit before the speed settled. Increase `--spinup` (up to 60000 ms). If the speed never settles, for example because the load fluctuates, increase `STEADY_TOL_PCT` in the firmware.
+
+**"Arduino error: motor did not stop"**
+The motor kept turning for `MAX_WAIT_STOP_MS` (2 minutes) before a run. Check that PWM = 0 really removes the drive, and that the encoder isn't picking up noise or vibration while the motor is stationary.
 
 **The run ends immediately with a coast time of 0 s**
 No encoder pulses are being counted. Check the wiring, check that `ENCONDER_PIN` is D2 or D3, and check that the encoder output needs `INPUT` and not `INPUT_PULLUP` (open-collector encoders need a pull-up).
@@ -196,4 +204,4 @@ Electrical noise from the motor brushes may be creating false pulses. Shield or 
 Check that the driver really coasts at PWM = 0 rather than braking.
 
 **Linker error: multiple definition of `setup` / `loop`**
-You are building both firmware files together. Build with `-e coastdown` or `-e manual` as described in [PlatformIO setup](#platformio-setup).
+More than one firmware file is in `src/`. PlatformIO compiles every file there, so keep only `coastdown_test.cpp`, or give each firmware its own environment with `build_src_filter`.
